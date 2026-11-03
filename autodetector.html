@@ -1,0 +1,200 @@
+<!doctype html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Автодетектор</title>
+<script src="https://cdn.jsdelivr.net/npm/@tensorflow/tfjs@4.17.0"></script>
+<script src="https://cdn.jsdelivr.net/npm/@tensorflow-models/coco-ssd@2.2.3"></script>
+<style>
+*{box-sizing:border-box}body{margin:0;padding:16px;background:#111827;color:#fff;font:16px Arial,sans-serif}
+h2{margin:0 0 14px}.controls{display:flex;flex-wrap:wrap;gap:10px;margin:12px 0}
+button,select{padding:12px;border:0;border-radius:8px;font-size:16px}
+button{background:#2563eb;color:white}button:disabled{opacity:.55}
+#view{position:relative;width:100%;overflow:hidden;border-radius:10px;background:#000;touch-action:none}
+video{display:block;width:100%;height:auto}canvas{position:absolute;inset:0;width:100%;height:100%;touch-action:none}
+#status{margin:12px 0;padding:12px;background:#374151;border-radius:8px;line-height:1.45}
+#alarm{display:none;background:#b91c1c;padding:14px;border-radius:8px;margin:12px 0;font-weight:bold}
+small{color:#cbd5e1;line-height:1.5}
+</style>
+</head>
+<body>
+<h2>Автодетектор</h2>
+<div class="controls">
+  <button id="start">Запустить камеру</button>
+  <button id="select" disabled>Выделить зону</button>
+  <button id="alarmTest">Тест сирены</button>
+</div>
+<div class="controls">
+  <label>Время остановки:
+    <select id="delay">
+      <option value="3">3 секунды</option>
+      <option value="5" selected>5 секунд</option>
+      <option value="10">10 секунд</option>
+      <option value="30">30 секунд</option>
+    </select>
+  </label>
+</div>
+<div id="alarm">⚠ Автомобиль остановился в зоне!</div>
+<div id="view">
+  <video id="camera" autoplay muted playsinline></video>
+  <canvas id="overlay"></canvas>
+</div>
+<div id="status">Нажми «Запустить камеру».</div>
+<small>Сначала разреши доступ к камере. Для камеры браузеру нужна HTTPS-страница (или localhost); открытие HTML как file:// обычно не работает. Распознавание загружает модель из интернета.</small>
+
+<script>
+const video=document.getElementById('camera');
+const canvas=document.getElementById('overlay');
+const ctx=canvas.getContext('2d');
+const statusEl=document.getElementById('status');
+const alarmBox=document.getElementById('alarm');
+const startBtn=document.getElementById('start');
+const selectBtn=document.getElementById('select');
+
+let model=null,stream=null,running=false,selecting=false,roi=null;
+let trackedCar=null,stationarySince=null,alarmOn=false;
+let audioContext=null,oscillator=null,gain=null,lastDetection=0;
+const detectionInterval=350;
+
+function status(t){statusEl.textContent=t}
+
+async function startCamera(){
+  if(!window.isSecureContext || !navigator.mediaDevices?.getUserMedia){
+    status('Камера недоступна: открой эту страницу по HTTPS (или через localhost), не как file://.');
+    return;
+  }
+  startBtn.disabled=true;
+  try{
+    status('Запрашиваю доступ к камере…');
+    stream=await navigator.mediaDevices.getUserMedia({
+      video:{facingMode:{ideal:'environment'},width:{ideal:640},height:{ideal:480}},
+      audio:false
+    });
+    video.srcObject=stream;
+    await video.play();
+    canvas.width=video.videoWidth;
+    canvas.height=video.videoHeight;
+    status('Камера включена. Загружаю модель распознавания…');
+    model=await cocoSsd.load();
+    running=true;
+    selectBtn.disabled=false;
+    status('Готово. Нажми «Выделить зону» и проведи пальцем по изображению.');
+    requestAnimationFrame(loop);
+  }catch(e){
+    startBtn.disabled=false;
+    const msg=e.name==='NotAllowedError'
+      ?'Доступ запрещён. Разреши камеру для этого сайта в настройках Chrome и перезагрузи страницу.'
+      :e.name==='NotFoundError'?'Камера не найдена.'
+      :e.name==='NotReadableError'?'Камера занята другим приложением. Закрой его и повтори.'
+      :'Ошибка '+e.name+': '+e.message;
+    status(msg);
+    if(stream){stream.getTracks().forEach(t=>t.stop());stream=null}
+  }
+}
+startBtn.addEventListener('click',startCamera);
+
+selectBtn.addEventListener('click',()=>{
+  if(!running)return;
+  selecting=true;roi=null;trackedCar=null;stationarySince=null;stopAlarm();
+  status('Проведи пальцем по изображению, чтобы выделить прямоугольник.');
+});
+let startX=0,startY=0;
+function point(e){
+  const r=canvas.getBoundingClientRect();
+  return {x:(e.clientX-r.left)*canvas.width/r.width,y:(e.clientY-r.top)*canvas.height/r.height};
+}
+canvas.addEventListener('pointerdown',e=>{
+  if(!selecting)return;
+  const p=point(e);startX=p.x;startY=p.y;
+  roi={x:startX,y:startY,w:0,h:0};
+  canvas.setPointerCapture(e.pointerId);
+});
+canvas.addEventListener('pointermove',e=>{
+  if(!selecting||!roi)return;
+  const p=point(e);
+  roi={x:Math.min(startX,p.x),y:Math.min(startY,p.y),w:Math.abs(p.x-startX),h:Math.abs(p.y-startY)};
+});
+canvas.addEventListener('pointerup',()=>{
+  if(!selecting||!roi)return;
+  selecting=false;
+  if(roi.w<20||roi.h<20){roi=null;status('Зона слишком маленькая. Выдели её заново.');return}
+  trackedCar=null;stationarySince=null;stopAlarm();
+  status('Зона задана. Ожидание автомобиля.');
+});
+function inside(x,y){return roi&&x>=roi.x&&x<=roi.x+roi.w&&y>=roi.y&&y<=roi.y+roi.h}
+function draw(){
+  ctx.clearRect(0,0,canvas.width,canvas.height);
+  if(roi){ctx.strokeStyle='#00ff66';ctx.lineWidth=3;ctx.strokeRect(roi.x,roi.y,roi.w,roi.h);ctx.fillStyle='rgba(0,255,100,.12)';ctx.fillRect(roi.x,roi.y,roi.w,roi.h)}
+}
+async function loop(ts){
+  if(!running)return;
+  draw();
+  if(model&&ts-lastDetection>=detectionInterval){
+    lastDetection=ts;
+    try{processPredictions(await model.detect(video))}
+    catch(e){status('Ошибка распознавания: '+e.message)}
+  }
+  requestAnimationFrame(loop);
+}
+function processPredictions(predictions){
+  if(!roi)return;
+  const cars=predictions.filter(p=>['car','truck','bus'].includes(p.class)&&p.score>=.55);
+  let candidate=null;
+  for(const car of cars){
+    const [x,y,w,h]=car.bbox;
+    const cx=x+w/2,cy=y+h/2;
+    if(inside(cx,cy)){candidate={x:cx,y:cy};break}
+  }
+  if(!candidate){
+    trackedCar=null;stationarySince=null;stopAlarm();
+    status('В зоне нет распознанного автомобиля.');return;
+  }
+  const tolerance=Math.max(canvas.width,canvas.height)*.02;
+  if(!trackedCar){
+    trackedCar=candidate;stationarySince=Date.now();
+    status('Автомобиль обнаружен. Проверяю остановку…');return;
+  }
+  const distance=Math.hypot(candidate.x-trackedCar.x,candidate.y-trackedCar.y);
+  if(distance>tolerance){
+    trackedCar=candidate;stationarySince=Date.now();stopAlarm();
+    status('Автомобиль движется. Сирена не включается.');return;
+  }
+  const elapsed=(Date.now()-stationarySince)/1000;
+  const required=Number(document.getElementById('delay').value);
+  status(`Автомобиль неподвижен: ${elapsed.toFixed(1)} / ${required} сек.`);
+  if(elapsed>=required&&!alarmOn)startAlarm();
+}
+async function startAlarm(){
+  alarmOn=true;alarmBox.style.display='block';
+  try{
+    if(!audioContext)audioContext=new (window.AudioContext||window.webkitAudioContext)();
+    await audioContext.resume();
+    oscillator=audioContext.createOscillator();gain=audioContext.createGain();
+    oscillator.type='sawtooth';oscillator.frequency.value=850;gain.gain.value=.22;
+    oscillator.connect(gain);gain.connect(audioContext.destination);oscillator.start();
+    let high=true;
+    const timer=setInterval(()=>{
+      if(!alarmOn||!gain){clearInterval(timer);return}
+      high=!high;gain.gain.setTargetAtTime(high?.22:0,audioContext.currentTime,.03);
+    },400);
+    oscillator.onended=()=>clearInterval(timer);
+  }catch(e){status('Не удалось включить звук. Нажми «Тест сирены» и разреши звук.')}
+}
+function stopAlarm(){
+  alarmOn=false;alarmBox.style.display='none';
+  if(oscillator){try{oscillator.stop()}catch{}oscillator=null}
+  if(gain){gain.disconnect();gain=null}
+}
+document.getElementById('alarmTest').addEventListener('click',async()=>{
+  try{
+    if(!audioContext)audioContext=new (window.AudioContext||window.webkitAudioContext)();
+    await audioContext.resume();
+    const o=audioContext.createOscillator(),g=audioContext.createGain();
+    o.frequency.value=850;g.gain.value=.22;o.connect(g);g.connect(audioContext.destination);
+    o.start();setTimeout(()=>{try{o.stop()}catch{}},1200);
+  }catch(e){status('Звук заблокирован браузером: '+e.message)}
+});
+</script>
+</body>
+</html>
